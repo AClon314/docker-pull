@@ -14,7 +14,7 @@ Fixes from https://github.com/heran226813/docker-drag (centralised request sessi
 To use this script, you can run it from the command line with the following arguments:
 `python3 contarner_pull.py --username USERNAME --password PASSWORD [registry/][repository/]image[:tag|@digest]" out.tar`
 
-See the full help with `python3 contarner_pull.py --help`.REGISTRY_USERNAME
+See the full help with `python3 contarner_pull.py --help`.
 You may also set the environment variables `REGISTRY_USERNAME` and `REGISTRY_PASSWORD` to avoid typing them in the command line.
 
 ## Module import
