@@ -14,7 +14,8 @@ Fixes from https://github.com/heran226813/docker-drag (centralised request sessi
 To use this script, you can run it from the command line with the following arguments:
 `python3 contarner_pull.py --username USERNAME --password PASSWORD [registry/][repository/]image[:tag|@digest]" out.tar`
 
-See the full help with `python3 contarner_pull.py --help`.
+See the full help with `python3 contarner_pull.py --help`.REGISTRY_USERNAME
+You may also set the environment variables `REGISTRY_USERNAME` and `REGISTRY_PASSWORD` to avoid typing them in the command line.
 
 ## Module import
 
@@ -31,11 +32,11 @@ Released under GNU General Public License v3.0 as `docker-drag`.
 
 import os
 import sys
-import gzip
+import gzip 
 import json
 import hashlib
 import shutil
-from typing import Self
+from typing import Optional, Self
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -67,7 +68,7 @@ def create_session() -> requests.Session:
     https_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
 
     if http_proxy or https_proxy:
-        session.proxies = {"http": http_proxy, "https": https_proxy}
+        session.proxies = {"http": http_proxy, "https": https_proxy}  # type: ignore
         logger.info("[+] Using proxy settings from environment")
 
     return session
@@ -77,15 +78,15 @@ def create_session() -> requests.Session:
 
 
 class DockerImageDetails:
-    original_url = None
+    original_url: str
     """Original URL of the Docker image"""
-    auth_url = None
+    auth_url: str
     """Authentication URL for Docker Image Registry; should get from image registry"""
-    registry_host_url = "registry-1.docker.io"
+    registry_host_url: str = "registry-1.docker.io"
     """Registry URL for Docker Image Registry"""
-    repo_name = None
+    repo_name: str
     """Image name without registry and tag"""
-    tag = "latest"
+    tag: str = "latest"
     """Image tag"""
 
     json_manifest_type = "application/vnd.docker.distribution.manifest.v2+json"
@@ -94,27 +95,27 @@ class DockerImageDetails:
     def __init__(
         self,
         original_url: str,
-        auth_url: str = None,
-        registry_host_url: str = None,
-        repo_name: str = None,
-        tag: str = None,
+        auth_url: str,
+        registry_host_url: str,
+        repo_name: str,
+        tag: str,
     ):
-        self.original_url = original_url
-        self.auth_url = auth_url
-        self.registry_host_url = registry_host_url
-        self.repo_name = repo_name
-        self.tag = tag
+        self.original_url: str = original_url
+        self.auth_url: str = auth_url
+        self.registry_host_url: str = registry_host_url
+        self.repo_name: str = repo_name
+        self.tag: str = tag
 
-    def get_manifest_url(self, manifest_name: str = None):
+    def get_manifest_url(self, manifest_name: Optional[str] = None) -> str:
         if manifest_name is None:
             manifest_name = self.tag
         return f"https://{self.registry_host_url}/v2/{self.repo_name}/manifests/{manifest_name}"
 
-    def get_blobs_url(self, digest: str):
+    def get_blobs_url(self, digest: str) -> str:
         return f"https://{self.registry_host_url}/v2/{self.repo_name}/blobs/{digest}"
 
     @property
-    def repository_reference(self):
+    def repository_reference(self) -> str:
         """Repository reference (registry and repository) without tag"""
         if self.registry_host_url == self.__class__.registry_host_url:
             return f"{self.repo_name}"
@@ -122,20 +123,23 @@ class DockerImageDetails:
             return f"{self.registry_host_url}/{self.repo_name}"
 
     @property
-    def fully_qualified_image_name(self):
+    def fully_qualified_image_name(self) -> str:
         """Fully qualified image name (registry, repository and tag)"""
         return f"{self.repository_reference}:{self.tag}"
 
     @property
-    def image_file_name(self):
+    def image_file_name(self) -> str:
         return self.repo_name.replace("/", "_") + "_" + self.tag + ".tar"
 
     def get_auth_headers(
-        self, session: requests.Session, username: str = None, password: str = None
+        self,
+        session: requests.Session,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
     ):
         """Get Docker request authentication token for header.
         This function is useless for unauthenticated registries like Microsoft.
-        
+
         For registries that allows authenticate with PAT (e.g. Forgejo), you may provide the token explicitly as keyword argument `password="TOKEN"` without a `username`.
         """
         try:
@@ -144,8 +148,8 @@ class DockerImageDetails:
             if password is not None:
                 # username might be None for PAT
                 auth = (username, password)
-            
-            resp = session.get(self.auth_url, verify=False, timeout=30, auth=auth)
+
+            resp = session.get(self.auth_url, verify=False, timeout=30, auth=auth)  # type: ignore
             if resp.status_code != 200:
                 # authentication failed or user error
                 raise requests.exceptions.RequestException(
@@ -168,6 +172,8 @@ class DockerImageDetails:
         session: requests.Session, registry_host_url: str, repository: str
     ):
         """Get endpoint registry from url"""
+        # default auth url is same as registry url
+        server_auth_url = "https://" + registry_host_url + "/v2/"
         try:
             logger.info(f"[+] Connecting to registry: {registry_host_url}")
             resp = session.get(
@@ -178,6 +184,7 @@ class DockerImageDetails:
                     realm_address = re.search(
                         'realm="([^"]*)"', resp.headers["WWW-Authenticate"]
                     )
+                    assert realm_address is not None  # type check
 
                     # If Repository is on NEXUS OSS
                     if realm_address.group(1) == "Sonatype Nexus Repository Manager":
@@ -185,17 +192,17 @@ class DockerImageDetails:
                         logger.debug("[ ] Detected: Nexus OSS repository type")
 
                     # If Repository is on DockerHub like
-                    if realm_address.group(
+                    elif realm_address.group(
                         1
                     ) != registry_host_url and "http" in realm_address.group(1):
                         service = re.search(
                             'service="([^"]*)"', resp.headers["WWW-Authenticate"]
                         )
+                        assert service is not None  # type check
                         server_auth_url = f"{realm_address.group(1)}?service={service.group(1)}&scope=repository:{repository}:pull"
                         logger.debug("[ ] Detected: Docker Hub repository type")
 
                 except IndexError:
-                    server_auth_url = "https://" + registry_host_url + "/v2/"
                     logger.info(
                         "[-] Failed to fetch authentication endpoint info from registry, using registry URL"
                     )
@@ -244,11 +251,11 @@ class DockerImageDetails:
         auth_url = cls.get_endpoint_registry(session, registry_host_url, repository)
 
         logger.info("_" * 50)
-        logger.info("Docker image :\t" + img)
-        logger.info("Docker tag :\t" + tag)
-        logger.info("Repository :\t" + repository)
-        logger.info("Server URL :\t" + registry_host_url)
-        logger.info("Auth endpoint :\t" + auth_url)
+        logger.info(f"Docker image :\t{img}")
+        logger.info(f"Docker tag :\t{tag}")
+        logger.info(f"Repository :\t{repository}")
+        logger.info(f"Server URL :\t{registry_host_url}")
+        logger.info(f"Auth endpoint :\t{auth_url}")
         logger.info("_" * 50)
 
         return cls(
@@ -280,9 +287,9 @@ def progress_bar(ublob, nb_traits):
 def save_docker_image(
     image_url: str,
     output_path: str | os.PathLike,
-    registry_username: str = None,
-    registry_password: str = None,
-    session: requests.Session = None,
+    registry_username: Optional[str] = None,
+    registry_password: Optional[str] = None,
+    session: Optional[requests.Session] = None,
 ):
     """
     Downloads a Docker image from a remote registry and saves it as a tar archive.
@@ -315,7 +322,6 @@ def save_docker_image(
     - The function uses a temporary directory ("tmp") during processing which is cleaned up in all cases.
     - The method of generating fake layer IDs is simplistic and may not match Docker's actual layer ID generation.
     """
-
 
     if session is None:
         session = create_session()
@@ -443,7 +449,7 @@ def save_docker_image(
 
         except KeyError as e:
             logger.error("[-] Error: Could not find required key in response:", e)
-            logger.error("[-] Available keys:", list(resp_json.keys()))
+            logger.error("[-] Available keys:", list(resp_json.keys()))  # type: ignore
             exit(1)
         except Exception as e:
             logger.error("[-] Unexpected error:", e)
@@ -591,7 +597,7 @@ def save_docker_image(
         file.close()
 
         content = {
-            image_details.repository_reference: {image_details.tag: fake_layerid}
+            image_details.repository_reference: {image_details.tag: fake_layerid}  # type: ignore
         }
         file = open(img_temp_dir + "/repositories", "w")
         file.write(json.dumps(content))
@@ -601,7 +607,7 @@ def save_docker_image(
         logger.info("[=] Creating archive...")
         if not output_path:
             output_path = image_details.image_file_name
-        if not output_path.endswith(".tar"):
+        if not output_path or not str(output_path).endswith(".tar"):
             output_path = str(output_path) + ".tar"
         tar = tarfile.open(output_path, "w")
         tar.add(img_temp_dir, arcname=os.path.sep)
@@ -623,7 +629,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Pull a Docker image and save it as a tar archive."
     )
-    parser.add_argument("image", help="docker image name in the format of [registry/][repository/]image[:tag|@digest]")
+    parser.add_argument(
+        "image",
+        help="docker image name in the format of [registry/][repository/]image[:tag|@digest]",
+    )
     parser.add_argument(
         "output_path", nargs="?", help="output path for the image tar", default=None
     )
