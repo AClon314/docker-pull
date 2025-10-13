@@ -1,9 +1,13 @@
+#!/bin/env python
+# PYTHON_ARGCOMPLETE_OK
 """
 # contarner-pull
 
 This repository contains Python scripts for interacting with Docker Hub or other registries, without needing the Docker client itself. A fork of https://github.com/NotGlop/docker-drag as a module and better CLI interaction.
 
 It relies on the Docker registry [HTTPS API v2](https://docs.docker.com/registry/spec/api/).
+
+Recommand to install `argcomplete aria2p[gui]` for shell tab completion and faster & **resume download**.
 
 ## Updates
 
@@ -32,11 +36,11 @@ Released under GNU General Public License v3.0 as `docker-drag`.
 
 import os
 import sys
-import gzip 
+import gzip
 import json
 import hashlib
 import shutil
-from typing import Optional, Self
+from typing import Literal, Optional, Self, get_args
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -50,6 +54,15 @@ urllib3.disable_warnings()
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+TYPE_REGISTRY = Literal[
+    "registry.k8s.io",
+    "registry.gitlab.com",
+    "ghcr.io",
+    "quay.io",
+    "docker.io",
+]
+REGISTRY = [reg + "/" for reg in get_args(TYPE_REGISTRY)]
 
 
 def create_session() -> requests.Session:
@@ -622,17 +635,15 @@ def save_docker_image(
             shutil.rmtree(img_temp_dir)
 
 
-if __name__ == "__main__":
-
-    ############## Parse arguments ##############
-
+def parse_arg():
     parser = argparse.ArgumentParser(
         description="Pull a Docker image and save it as a tar archive."
     )
-    parser.add_argument(
+    action = parser.add_argument(
         "image",
         help="docker image name in the format of [registry/][repository/]image[:tag|@digest]",
     )
+    action.completer = lambda prefix, **kwargs: REGISTRY  # type: ignore
     parser.add_argument(
         "output_path", nargs="?", help="output path for the image tar", default=None
     )
@@ -655,9 +666,22 @@ if __name__ == "__main__":
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         help="set logging level (default: INFO)",
     )
+    try:
+        import argcomplete
 
+        argcomplete.autocomplete(parser)
+    except ImportError:
+        ...
     args = parser.parse_args()
+    return args
+
+
+if __name__ == "__main__":
+    args = parse_arg()
     logging.basicConfig(level=args.verbose)
     logger.setLevel(args.verbose)
-
-    save_docker_image(args.image, args.output_path, args.username, args.password)
+    try:
+        save_docker_image(args.image, args.output_path, args.username, args.password)
+    except KeyboardInterrupt:
+        logger.warning("[-] Interrupted by user")
+        exit(1)
