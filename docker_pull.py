@@ -23,10 +23,11 @@ You may also set the environment variables `REGISTRY_USERNAME` and `REGISTRY_PAS
 
 ## Module import
 
-To use the function, import `save_docker_image()` and pass in the necessary arguments.
+To use the function, import `DockerPuller` and call `save_image()`:
 ```py
-from contarner_pull import save_docker_image
-save_docker_image(image_url, output_path, username, password)
+from contarner_pull import DockerPuller
+puller = DockerPuller(image_url, output_path="out.tar", registry_username="", registry_password="")
+puller.save_image()
 ```
 
 ## License
@@ -40,7 +41,7 @@ import gzip
 import json
 import hashlib
 import shutil
-from typing import Literal, Optional, Self, get_args
+from typing import Literal, Self, get_args
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -119,10 +120,9 @@ class DockerImageDetails:
         self.repo_name: str = repo_name
         self.tag: str = tag
 
-    def get_manifest_url(self, manifest_name: Optional[str] = None) -> str:
-        if manifest_name is None:
-            manifest_name = self.tag
-        return f"https://{self.registry_host_url}/v2/{self.repo_name}/manifests/{manifest_name}"
+    def get_manifest_url(self, manifest_name: str = "") -> str:
+        name = self.tag if not manifest_name else manifest_name
+        return f"https://{self.registry_host_url}/v2/{self.repo_name}/manifests/{name}"
 
     def get_blobs_url(self, digest: str) -> str:
         return f"https://{self.registry_host_url}/v2/{self.repo_name}/blobs/{digest}"
@@ -147,8 +147,8 @@ class DockerImageDetails:
     def get_auth_headers(
         self,
         session: requests.Session,
-        username: Optional[str] = None,
-        password: Optional[str] = None,
+        username: str = "",
+        password: str = "",
     ):
         """Get Docker request authentication token for header.
         This function is useless for unauthenticated registries like Microsoft.
@@ -158,11 +158,10 @@ class DockerImageDetails:
         try:
             # setup authentication with username and password
             auth = None
-            if password is not None:
-                # username might be None for PAT
+            if username and password != "":
                 auth = (username, password)
 
-            resp = session.get(self.auth_url, verify=False, timeout=30, auth=auth)  # type: ignore
+            resp = session.get(self.auth_url, verify=False, timeout=30, auth=auth)
             if resp.status_code != 200:
                 # authentication failed or user error
                 raise requests.exceptions.RequestException(
@@ -297,342 +296,450 @@ def progress_bar(ublob, nb_traits):
 ############################################## MAIN ########################################################
 
 
-def save_docker_image(
-    image_url: str,
-    output_path: str | os.PathLike,
-    registry_username: Optional[str] = None,
-    registry_password: Optional[str] = None,
-    session: Optional[requests.Session] = None,
-):
+class DockerPuller:
     """
-    Downloads a Docker image from a remote registry and saves it as a tar archive.
+    Orchestrates downloading a docker image and saving it as a tar archive.
 
-    Parameters
-    ----------
-    image_url : str
-        The Docker image URL or identifier.
-    output_path : str or os.PathLike
-        The file path where the Docker image tar archive will be saved.
-        The file extension will be automatically set to '.tar' if not match.
-    registry_username : str, optional
-        Username for authenticating with the Docker registry. Defaults to None.
-    registry_password : str, optional
-        Password for authenticating with the Docker registry. Defaults to None.
-        Pass PAT to this parameter without `registry_username` if you are using a Personal Access Token (PAT).
-    session : requests.Session, optional
-        A pre-configured `requests.Session` for HTTP requests. If not provided,
-        a new session is created internally.
-
-    Raises
-    ------
-    SystemExit
-        Exits the process (using `exit(1)`) on encountering network errors,
-        missing manifest data, or file operation failures.
-
-    Notes
-    -----
-    - HTTPS certificate verification is disabled (`verify=False`) for all HTTP requests.
-    - The function uses a temporary directory ("tmp") during processing which is cleaned up in all cases.
-    - The method of generating fake layer IDs is simplistic and may not match Docker's actual layer ID generation.
+    Args:
+        image_url: docker image name in the format of [registry/][repository/]image[:tag|@digest]
+        output_path: file path for final tar (if ends not with .tar it will be appended)
+        registry_username: registry username (empty string by default)
+        registry_password: registry password or PAT (empty string by default)
+        session: requests.Session instance. Default uses create_session() result.
     """
 
-    if session is None:
-        session = create_session()
+    def __init__(
+        self,
+        image_url: str,
+        output_path: str = "",
+        registry_username: str = "",
+        registry_password: str = "",
+        session: requests.Session = create_session(),
+    ):
+        self.image_url = image_url
+        self.output_path = output_path
+        self.registry_username = registry_username
+        self.registry_password = registry_password
+        self.session = session
+        self.img_temp_dir = "tmp"
+        self.image_details = DockerImageDetails.parse_image_name(
+            image_url, self.session
+        )
+        # placeholder for values filled during flow
+        self.manifest_json = {}
+        self.confresp_content = b""
+        self.fake_layerID = ""
 
-    image_details = DockerImageDetails.parse_image_name(image_url, session)
+    def save_image(self):
+        """High level orchestration; keeps each sub-step in a small method."""
+        try:
+            if not os.path.exists(self.img_temp_dir):
+                logger.debug("[+] Creating temporary directory: %s", self.img_temp_dir)
+                os.makedirs(self.img_temp_dir)
 
-    img_temp_dir = "tmp"
+            self._fetch_manifest()
+            self._download_config()
+            self._download_layers()
+            self._create_tar_and_cleanup()
+            logger.info(
+                f"[+] Docker image for {self.image_details.fully_qualified_image_name} is saved to {self.output_path or self.image_details.image_file_name}"
+            )
+        finally:
+            # clean up temp folder no matter what happens
+            if os.path.exists(self.img_temp_dir):
+                shutil.rmtree(self.img_temp_dir)
 
-    try:
-        # Create tmp directory if it doesn't exist
-        if not os.path.exists(img_temp_dir):
-            logger.debug("[+] Creating temporary directory:", img_temp_dir)
-            os.makedirs(img_temp_dir)
-
-        ############## Fetch manifest v2 and get image layer digests
-
+    def _fetch_manifest(self):
         logger.info(
-            f"[+] Trying to fetch manifest for {image_details.fully_qualified_image_name}"
+            f"[+] Trying to fetch manifest for {self.image_details.fully_qualified_image_name}"
         )
         try:
-            resp = session.get(
-                image_details.get_manifest_url(),
-                headers=image_details.get_auth_headers(
-                    session, registry_username, registry_password
+            resp = self.session.get(
+                self.image_details.get_manifest_url(),
+                headers=self.image_details.get_auth_headers(
+                    self.session, self.registry_username, self.registry_password
                 ),
                 verify=False,
                 timeout=30,
             )
         except requests.exceptions.RequestException as e:
-            logger.error("[-] Manifest fetch error:", str(e))
+            logger.error("[-] Manifest fetch error: %s", str(e))
             exit(1)
-        logger.debug("[+] Response status code:", resp.status_code)
-        logger.debug("[+] Response headers:", resp.headers)
 
         if resp.status_code != 200:
             logger.error(
-                f"[-] Cannot fetch manifest for {image_details.registry_host_url} [HTTP {resp.status_code}]"
+                f"[-] Cannot fetch manifest for {self.image_details.registry_host_url} [HTTP {resp.status_code}]"
             )
             logger.error(resp.content)
             exit(1)
-
-        content_type = resp.headers.get("content-type", "")
-        logger.debug("[+] Content type:", content_type)
 
         try:
             resp_json = resp.json()
             logger.debug("[+] Response JSON structure:")
             logger.debug(json.dumps(resp_json, indent=2))
 
-            # Handle manifest list (multi-arch images)
+            # Handle manifest list (multi-arch images) kept compact
             if "manifests" in resp_json:
-                logger.debug("[+] This is a multi-arch image. Available platforms:")
-                for m in resp_json["manifests"]:
-                    if "platform" in m:
-                        logger.debug(
-                            "    - {}/{} ({})".format(
-                                m["platform"].get("os", "unknown"),
-                                m["platform"].get("architecture", "unknown"),
-                                m["digest"],
-                            )
-                        )
-
-                # Try to find linux/amd64 platform first, then fall back to windows/amd64
-                selected_manifest = None
-                for m in resp_json["manifests"]:
-                    platform = m.get("platform", {})
-                    if (
-                        platform.get("os") == "linux"
-                        and platform.get("architecture") == "amd64"
-                    ):
-                        selected_manifest = m
-                        break
-
-                if not selected_manifest:
-                    for m in resp_json["manifests"]:
-                        platform = m.get("platform", {})
-                        if (
-                            platform.get("os") == "windows"
-                            and platform.get("architecture") == "amd64"
-                        ):
-                            selected_manifest = m
-                            break
-
-                if not selected_manifest:
-                    # If no preferred platform found, use the first one
-                    selected_manifest = resp_json["manifests"][0]
-
-                logger.info(
-                    "[+] Selected platform: {}/{}".format(
-                        selected_manifest["platform"].get("os", "unknown"),
-                        selected_manifest["platform"].get("architecture", "unknown"),
-                    )
-                )
-
-                # Fetch the specific manifest
+                selected_manifest = self._select_manifest(resp_json)
                 try:
-                    manifest_resp = session.get(
-                        image_details.get_manifest_url(selected_manifest["digest"]),
-                        headers=image_details.get_auth_headers(
-                            session, registry_username, registry_password
-                        ),  # get a fresh token
+                    manifest_resp = self.session.get(
+                        self.image_details.get_manifest_url(
+                            selected_manifest["digest"]
+                        ),
+                        headers=self.image_details.get_auth_headers(
+                            self.session, self.registry_username, self.registry_password
+                        ),
                         verify=False,
                         timeout=30,
                     )
                     if manifest_resp.status_code != 200:
                         logger.error(
-                            "[-] Failed to fetch specific manifest:",
+                            "[-] Failed to fetch specific manifest: %s",
                             manifest_resp.status_code,
                         )
-                        logger.error("[-] Response content:", manifest_resp.content)
+                        logger.error("[-] Response content: %s", manifest_resp.content)
                         exit(1)
                     resp_json = manifest_resp.json()
                     logger.info("[+] Successfully fetched specific manifest")
                 except Exception as e:
-                    logger.error("[-] Error fetching specific manifest:", e)
+                    logger.error("[-] Error fetching specific manifest: %s", e)
                     exit(1)
 
-            # Now we should have the actual manifest with layers
             if "layers" not in resp_json:
                 logger.error("[-] Error: No layers found in manifest")
-                logger.error("[-] Available keys:", list(resp_json.keys()))
+                logger.error("[-] Available keys: %s", list(resp_json.keys()))
                 exit(1)
 
-            layers = resp_json["layers"]
+            self.manifest_json = resp_json
 
         except KeyError as e:
-            logger.error("[-] Error: Could not find required key in response:", e)
-            logger.error("[-] Available keys:", list(resp_json.keys()))  # type: ignore
+            logger.error("[-] Error: Could not find required key in response: %s", e)
+            logger.error("[-] Available keys: %s", list(resp_json.keys()))
             exit(1)
         except Exception as e:
-            logger.error("[-] Unexpected error:", e)
+            logger.error("[-] Unexpected error: %s", e)
             exit(1)
 
-        # download digest to temp folder
-        config = resp_json["config"]["digest"]
+    def _select_manifest(self, resp_json: dict) -> dict:
+        logger.debug("[+] This is a multi-arch image. Scanning manifests")
+        # choose linux/amd64 first, fallback windows/amd64, else first
+        selected = None
+        for m in resp_json["manifests"]:
+            platform = m.get("platform", {})
+            if (
+                platform.get("os") == "linux"
+                and platform.get("architecture") == "amd64"
+            ):
+                selected = m
+                break
+        if not selected:
+            for m in resp_json["manifests"]:
+                platform = m.get("platform", {})
+                if (
+                    platform.get("os") == "windows"
+                    and platform.get("architecture") == "amd64"
+                ):
+                    selected = m
+                    break
+        if not selected:
+            selected = resp_json["manifests"][0]
+        logger.info(
+            "[+] Selected platform: %s/%s",
+            selected.get("platform", {}).get("os", "unknown"),
+            selected.get("platform", {}).get("architecture", "unknown"),
+        )
+        return selected
+
+    def _download_config(self):
+        config_digest = self.manifest_json["config"]["digest"]
         try:
-            confresp = session.get(
-                image_details.get_blobs_url(config),
-                headers=image_details.get_auth_headers(
-                    session, registry_username, registry_password
-                ),  # get a fresh token
+            confresp = self.session.get(
+                self.image_details.get_blobs_url(config_digest),
+                headers=self.image_details.get_auth_headers(
+                    self.session, self.registry_username, self.registry_password
+                ),
                 verify=False,
                 timeout=30,
             )
         except requests.exceptions.RequestException as e:
-            logger.error("[-] Config fetch error:", str(e))
+            logger.error("[-] Config fetch error: %s", str(e))
             exit(1)
-        file = open("{}/{}.json".format(img_temp_dir, config[7:]), "wb")
-        file.write(confresp.content)
-        file.close()
+        self.confresp_content = confresp.content
+        with open(f"{self.img_temp_dir}/{config_digest[7:]}.json", "wb") as file:
+            file.write(self.confresp_content)
 
-        content = [
+        # create base manifest file content list
+        self._manifest_content = [
             {
-                "Config": config[7:] + ".json",
-                "RepoTags": [image_details.fully_qualified_image_name],
+                "Config": config_digest[7:] + ".json",
+                "RepoTags": [self.image_details.fully_qualified_image_name],
                 "Layers": [],
             }
         ]
 
-        empty_json = '{"created":"1970-01-01T00:00:00Z","container_config":{"Hostname":"","Domainname":"","User":"","AttachStdin":false, \
-            "AttachStdout":false,"AttachStderr":false,"Tty":false,"OpenStdin":false, "StdinOnce":false,"Env":null,"Cmd":null,"Image":"", \
-            "Volumes":null,"WorkingDir":"","Entrypoint":null,"OnBuild":null,"Labels":null}}'
+    def _compute_fake_layerID(self, parentid: str, ublob: str) -> str:
+        """Compute fake layer id from parentid and digest."""
+        return hashlib.sha256(
+            (parentid + "\n" + ublob + "\n").encode("utf-8")
+        ).hexdigest()
 
-        # Build layer folders
-        parentid = ""
-        for layer in layers:
-            ublob = layer["digest"]
-            # FIXME: Creating fake layer ID. Don't know how Docker generates it
-            fake_layerid = hashlib.sha256(
-                (parentid + "\n" + ublob + "\n").encode("utf-8")
-            ).hexdigest()
-            layerdir = img_temp_dir + "/" + fake_layerid
-            os.mkdir(layerdir)
+    def _prepare_layer_dir(self, fake_layerID: str) -> str:
+        """Create directory for a layer and write VERSION file."""
+        layerdir = os.path.join(self.img_temp_dir, fake_layerID)
+        os.makedirs(layerdir, exist_ok=True)
+        with open(os.path.join(layerdir, "VERSION"), "w") as f:
+            f.write("1.0")
+        return layerdir
 
-            # Creating VERSION file
-            file = open(layerdir + "/VERSION", "w")
-            file.write("1.0")
-            file.close()
+    def _fetch_layer_response(self, layer: dict, ublob: str) -> requests.Response:
+        """Fetch layer content (primary blob URL then fallback to layer['urls'][0])."""
+        try:
+            bresp = self.session.get(
+                self.image_details.get_blobs_url(ublob),
+                headers=self.image_details.get_auth_headers(
+                    self.session, self.registry_username, self.registry_password
+                ),
+                stream=True,
+                verify=False,
+                timeout=30,
+            )
+        except requests.exceptions.RequestException as e:
+            logger.error("[-] Layer fetch error: %s", str(e))
+            exit(1)
 
-            # Creating layer.tar file
-            sys.stdout.write(ublob[7:19] + ": Downloading...")
-            sys.stdout.flush()
-            try:
-                bresp = session.get(
-                    image_details.get_blobs_url(ublob),
-                    headers=image_details.get_auth_headers(
-                        session, registry_username, registry_password
-                    ),  # get a fresh token
-                    stream=True,
-                    verify=False,
-                    timeout=30,
-                )
-            except requests.exceptions.RequestException as e:
-                logger.error("[-] Layer fetch error:", str(e))
-                exit(1)
-            if bresp.status_code != 200:  # When the layer is located at a custom URL
+        if bresp.status_code != 200:
+            # fallback to layer["urls"][0] if provided
+            fallback_url = None
+            if isinstance(layer.get("urls"), list) and layer["urls"]:
+                fallback_url = layer["urls"][0]
+            if fallback_url:
                 try:
-                    bresp = session.get(
-                        layer["urls"][0],
-                        headers=image_details.get_auth_headers(
-                            session, registry_username, registry_password
-                        ),  # get a fresh token
+                    bresp = self.session.get(
+                        fallback_url,
+                        headers=self.image_details.get_auth_headers(
+                            self.session, self.registry_username, self.registry_password
+                        ),
                         stream=True,
                         verify=False,
                         timeout=30,
                     )
                 except requests.exceptions.RequestException as e:
-                    logger.error("[-] Layer fetch error:", str(e))
+                    logger.error("[-] Layer fetch error: %s", str(e))
                     exit(1)
-                if bresp.status_code != 200:
-                    logger.error(
-                        "[-] ERROR: Cannot download layer {} [HTTP {}]".format(
-                            ublob[7:19],
-                            bresp.status_code,
-                            bresp.headers["Content-Length"],
-                        )
-                    )
-                    logger.error(bresp.content)
-                    exit(1)
-            # Stream download and follow the progress
+            if bresp.status_code != 200:
+                logger.error(
+                    "[-] ERROR: Cannot download layer %s [HTTP %s]",
+                    ublob[7:19],
+                    bresp.status_code,
+                )
+                logger.error(bresp.content)
+                exit(1)
+        return bresp
+
+    def _stream_save_gzip(
+        self, bresp: requests.Response, gzip_path: str, ublob: str
+    ) -> None:
+        """Stream response content into gzip_path while updating the progress bar."""
+        try:
             bresp.raise_for_status()
-            unit = int(bresp.headers["Content-Length"]) / 50
-            acc = 0
-            nb_traits = 0
-            progress_bar(ublob, nb_traits)
-            with open(layerdir + "/layer_gzip.tar", "wb") as file:
-                for chunk in bresp.iter_content(chunk_size=8192):
-                    if chunk:
-                        file.write(chunk)
-                        acc = acc + 8192
-                        if acc > unit:
-                            nb_traits = nb_traits + 1
-                            progress_bar(ublob, nb_traits)
-                            acc = 0
-            sys.stdout.write(
-                f"\r{ublob[7:19]}: Extracting...{' ' * 50}"
-            )  # Ugly but works everywhere
-            sys.stdout.flush()
-            with open(
-                layerdir + "/layer.tar", "wb"
-            ) as file:  # Decompress gzip response
-                unzLayer = gzip.open(layerdir + "/layer_gzip.tar", "rb")
-                shutil.copyfileobj(unzLayer, file)
-                unzLayer.close()
-            os.remove(layerdir + "/layer_gzip.tar")
-            logger.info(
-                f"\r{ublob[7:19]}: Pull complete [{(bresp.headers["Content-Length"])}]\r"
-            )
-            content[0]["Layers"].append(fake_layerid + "/layer.tar")
+        except Exception as e:
+            logger.error("[-] Layer stream error: %s", e)
+            exit(1)
 
-            # Creating json file
-            file = open(layerdir + "/json", "w")
-            # last layer = config manifest - history - rootfs
-            if layers[-1]["digest"] == layer["digest"]:
-                # FIXME: json.loads() automatically converts to unicode, thus decoding values whereas Docker doesn't
-                json_obj = json.loads(confresp.content)
+        content_length = int(bresp.headers.get("Content-Length", "0"))
+        unit = content_length / 50 if content_length else 1
+        acc = 0
+        nb_traits = 0
+        progress_bar(ublob, nb_traits)
+        with open(gzip_path, "wb") as file:
+            for chunk in bresp.iter_content(chunk_size=8192):
+                if chunk:
+                    file.write(chunk)
+                    acc += len(chunk)
+                    if acc > unit:
+                        nb_traits += 1
+                        progress_bar(ublob, nb_traits)
+                        acc = 0
+
+    def _decompress_layer(self, gzip_path: str, layerdir: str, ublob: str) -> None:
+        """Decompress gzip_path into layer.tar inside layerdir and remove gzip file."""
+        sys.stdout.write(f"\r{ublob[7:19]}: Extracting...{' ' * 50}")
+        sys.stdout.flush()
+        with open(os.path.join(layerdir, "layer.tar"), "wb") as out_f:
+            with gzip.open(gzip_path, "rb") as unzLayer:
+                shutil.copyfileobj(unzLayer, out_f)
+        try:
+            os.remove(gzip_path)
+        except Exception:
+            # don't block on cleanup failure
+            logger.debug("[-] Failed to remove temporary gzip file: %s", gzip_path)
+
+    def _build_and_write_layer_json(
+        self,
+        layer: dict,
+        is_last: bool,
+        fake_layerID: str,
+        parentid: str,
+        empty_json: str,
+        layerdir: str,
+    ) -> str:
+        """
+        Build the layer json structure and write to file.
+        Returns the new parentid (which equals fake_layerID).
+        """
+        if is_last:
+            json_obj = json.loads(self.confresp_content)
+            # attempt to remove keys similar to original behavior
+            if "history" in json_obj:
                 del json_obj["history"]
+            try:
+                del json_obj["rootfs"]
+            except Exception:
                 try:
-                    del json_obj["rootfs"]
-                except:  # Because Microsoft loves case insensitiveness
                     del json_obj["rootfS"]
-            else:  # other layers json are empty
-                json_obj = json.loads(empty_json)
-            json_obj["id"] = fake_layerid
-            if parentid:
-                json_obj["parent"] = parentid
-            parentid = json_obj["id"]
-            file.write(json.dumps(json_obj))
-            file.close()
+                except Exception:
+                    pass
+        else:
+            json_obj = json.loads(empty_json)
 
-        file = open(img_temp_dir + "/manifest.json", "w")
-        file.write(json.dumps(content))
-        file.close()
+        json_obj["id"] = fake_layerID
+        if parentid:
+            json_obj["parent"] = parentid
+
+        with open(os.path.join(layerdir, "json"), "w") as jf:
+            jf.write(json.dumps(json_obj))
+
+        return json_obj["id"]
+
+    def _download_layers(self):
+        """High-level loop over manifest layers delegating to helper methods."""
+        layers = self.manifest_json["layers"]
+        empty_json = '{"created":"1970-01-01T00:00:00Z","container_config":{"Hostname":"","Domainname":"","User":"","AttachStdin":false, \
+            "AttachStdout":false,"AttachStderr":false,"Tty":false,"OpenStdin":false, "StdinOnce":false,"Env":null,"Cmd":null,"Image":"", \
+            "Volumes":null,"WorkingDir":"","Entrypoint":null,"OnBuild":null,"Labels":null}}'
+
+        parentid = ""
+        for layer in layers:
+            ublob = layer["digest"]
+            fake_layerID = self._compute_fake_layerID(parentid, ublob)
+            layerdir = self._prepare_layer_dir(fake_layerID)
+            gzip_path = os.path.join(layerdir, "layer_gzip.tar")
+
+            # Download layer (stream)
+            sys.stdout.write(ublob[7:19] + ": Downloading...")
+            sys.stdout.flush()
+            try:
+                dl_by_aria2(
+                    url,
+                    gzip_path,
+                    headers=self.image_details.get_auth_headers(
+                        self.session, self.registry_username, self.registry_password
+                    ),
+                )
+            except Exception as e:
+                logger.error("[-] Failed to download layer %s: %s", ublob[7:19], e)
+            bresp = self._fetch_layer_response(layer, ublob)
+
+            self._stream_save_gzip(bresp, gzip_path, ublob)
+            self._decompress_layer(gzip_path, layerdir, ublob)
+
+            logger.info(
+                "\r%s: Pull complete [%s]\r",
+                ublob[7:19],
+                bresp.headers.get("Content-Length"),
+            )
+            self._manifest_content[0]["Layers"].append(fake_layerID + "/layer.tar")
+
+            # Create layer json and update parentid
+            is_last = layers[-1]["digest"] == layer["digest"]
+            parentid = self._build_and_write_layer_json(
+                layer, is_last, fake_layerID, parentid, empty_json, layerdir
+            )
+
+            # record last fake id for repositories mapping
+            self.fake_layerID = fake_layerID
+
+    def _create_tar_and_cleanup(self):
+        # manifest.json
+        with open(os.path.join(self.img_temp_dir, "manifest.json"), "w") as mf:
+            mf.write(json.dumps(self._manifest_content))
 
         content = {
-            image_details.repository_reference: {image_details.tag: fake_layerid}  # type: ignore
+            self.image_details.repository_reference: {
+                self.image_details.tag: self.fake_layerID
+            }
         }
-        file = open(img_temp_dir + "/repositories", "w")
-        file.write(json.dumps(content))
-        file.close()
+        with open(os.path.join(self.img_temp_dir, "repositories"), "w") as rf:
+            rf.write(json.dumps(content))
 
-        # Create image tar from temp folder and clean tmp directory
         logger.info("[=] Creating archive...")
-        if not output_path:
-            output_path = image_details.image_file_name
-        if not output_path or not str(output_path).endswith(".tar"):
-            output_path = str(output_path) + ".tar"
-        tar = tarfile.open(output_path, "w")
-        tar.add(img_temp_dir, arcname=os.path.sep)
-        tar.close()
-        logger.info(
-            f"[+] Docker image for {image_details.fully_qualified_image_name} is saved to {output_path}"
-        )
+        out_path = self.output_path or self.image_details.image_file_name
+        if not str(out_path).endswith(".tar"):
+            out_path = str(out_path) + ".tar"
+        with tarfile.open(out_path, "w") as tar:
+            tar.add(self.img_temp_dir, arcname=os.path.sep)
+        self.output_path = out_path
 
-    finally:
-        # clean up temp folder no matter what happens
-        if os.path.exists(img_temp_dir):
-            shutil.rmtree(img_temp_dir)
+
+def dl_by_aria2(
+    url: str,
+    out_path: str,
+    headers: dict | None = None,
+    aria2_host: str = "http://localhost",
+    aria2_port: int = 6800,
+    aria2_secret: str | None = None,
+    timeout: int = 300,
+):
+    """
+    Use aria2 RPC (aria2p) to download `url` into `out_path`. Waits until download completes.
+    Raises RuntimeError on failure.
+    """
+    try:
+        import aria2p
+    except Exception as e:
+        raise RuntimeError("aria2p not installed") from e
+
+    client = aria2p.Client(host=aria2_host, port=aria2_port, secret=aria2_secret)
+    api = aria2p.API(client=client)
+
+    options = {}
+    # aria2 options: set directory and output filename
+    out_dir = os.path.dirname(out_path) or "."
+    options["dir"] = out_dir
+    options["out"] = os.path.basename(out_path)
+
+    if headers:
+        # convert dict -> list of "Header: value"
+        hdrs = [f"{k}: {v}" for k, v in headers.items()]
+        options["header"] = hdrs
+
+    # add uri and start download
+    download = api.add_uris([url], options=options)
+
+    # wait loop (poll)
+    import time
+
+    start = time.time()
+    while True:
+        # refresh download state
+        d = api.get_download(download.gid)
+        if d.is_complete:
+            # success
+            local = os.path.join(out_dir, options["out"])
+            if not os.path.exists(local):
+                raise RuntimeError(
+                    f"aria2 reported complete, but file not found: {local}"
+                )
+            return local
+        if d.is_error:
+            raise RuntimeError(
+                f"aria2 download failed: {d.error_message} (gid={d.gid})"
+            )
+        if time.time() - start > timeout:
+            raise RuntimeError(
+                f"aria2 download timeout after {timeout}s for gid={download.gid}"
+            )
+        time.sleep(0.5)
 
 
 def parse_arg():
@@ -645,19 +752,19 @@ def parse_arg():
     )
     action.completer = lambda prefix, **kwargs: REGISTRY  # type: ignore
     parser.add_argument(
-        "output_path", nargs="?", help="output path for the image tar", default=None
+        "output_path", nargs="?", help="output path for the image tar", default=""
     )
     parser.add_argument(
         "--username",
         "-u",
         help="container registry username",
-        default=os.getenv("REGISTRY_USERNAME"),
+        default=os.getenv("REGISTRY_USERNAME", ""),
     )
     parser.add_argument(
         "--password",
         "-p",
         help="container registry password. Pass PAT to this parameter without --username if you are using a Personal Access Token (PAT)",
-        default=os.getenv("REGISTRY_PASSWORD"),
+        default=os.getenv("REGISTRY_PASSWORD", ""),
     )
     parser.add_argument(
         "--verbose",
@@ -681,7 +788,13 @@ if __name__ == "__main__":
     logging.basicConfig(level=args.verbose)
     logger.setLevel(args.verbose)
     try:
-        save_docker_image(args.image, args.output_path, args.username, args.password)
+        puller = DockerPuller(
+            args.image,
+            output_path=args.output_path,
+            registry_username=args.username,
+            registry_password=args.password,
+        )
+        puller.save_image()
     except KeyboardInterrupt:
         logger.warning("[-] Interrupted by user")
         exit(1)
