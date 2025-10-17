@@ -177,7 +177,7 @@ class DockerImageDetails:
             return auth_head
         except requests.exceptions.RequestException as e:
             logger.error(f"[-] Authentication error: {e}")
-            exit(1)
+            raise
 
     @staticmethod
     def get_endpoint_registry(
@@ -231,7 +231,7 @@ class DockerImageDetails:
             logger.error(
                 f"    4. Verify if the registry {registry_host_url} is accessible from your network"
             )
-            exit(1)
+            raise
 
     @classmethod
     def parse_image_name(cls, image_name: str, session: requests.Session) -> Self:
@@ -364,14 +364,14 @@ class DockerPuller:
             )
         except requests.exceptions.RequestException as e:
             logger.error("[-] Manifest fetch error: %s", str(e))
-            exit(1)
+            raise
 
         if resp.status_code != 200:
             logger.error(
                 f"[-] Cannot fetch manifest for {self.image_details.registry_host_url} [HTTP {resp.status_code}]"
             )
             logger.error(resp.content)
-            exit(1)
+            raise
 
         try:
             resp_json = resp.json()
@@ -398,27 +398,27 @@ class DockerPuller:
                             manifest_resp.status_code,
                         )
                         logger.error("[-] Response content: %s", manifest_resp.content)
-                        exit(1)
+                        raise
                     resp_json = manifest_resp.json()
                     logger.info("[+] Successfully fetched specific manifest")
                 except Exception as e:
                     logger.error("[-] Error fetching specific manifest: %s", e)
-                    exit(1)
+                    raise
 
             if "layers" not in resp_json:
                 logger.error("[-] Error: No layers found in manifest")
                 logger.error("[-] Available keys: %s", list(resp_json.keys()))
-                exit(1)
+                raise
 
             self.manifest_json = resp_json
 
         except KeyError as e:
             logger.error("[-] Error: Could not find required key in response: %s", e)
             logger.error("[-] Available keys: %s", list(resp_json.keys()))
-            exit(1)
+            raise
         except Exception as e:
             logger.error("[-] Unexpected error: %s", e)
-            exit(1)
+            raise
 
     def _select_manifest(self, resp_json: dict) -> dict:
         logger.debug("[+] This is a multi-arch image. Scanning manifests")
@@ -463,7 +463,7 @@ class DockerPuller:
             )
         except requests.exceptions.RequestException as e:
             logger.error("[-] Config fetch error: %s", str(e))
-            exit(1)
+            raise
         self.confresp_content = confresp.content
         with open(f"{self.img_temp_dir}/{config_digest[7:]}.json", "wb") as file:
             file.write(self.confresp_content)
@@ -505,7 +505,7 @@ class DockerPuller:
             )
         except requests.exceptions.RequestException as e:
             logger.error("[-] Layer fetch error: %s", str(e))
-            exit(1)
+            raise
 
         if bresp.status_code != 200:
             # fallback to layer["urls"][0] if provided
@@ -525,7 +525,7 @@ class DockerPuller:
                     )
                 except requests.exceptions.RequestException as e:
                     logger.error("[-] Layer fetch error: %s", str(e))
-                    exit(1)
+                    raise
             if bresp.status_code != 200:
                 logger.error(
                     "[-] ERROR: Cannot download layer %s [HTTP %s]",
@@ -533,7 +533,7 @@ class DockerPuller:
                     bresp.status_code,
                 )
                 logger.error(bresp.content)
-                exit(1)
+                raise
         return bresp
 
     def _stream_save_gzip(
@@ -544,7 +544,7 @@ class DockerPuller:
             bresp.raise_for_status()
         except Exception as e:
             logger.error("[-] Layer stream error: %s", e)
-            exit(1)
+            raise
 
         content_length = int(bresp.headers.get("Content-Length", "0"))
         unit = content_length / 50 if content_length else 1
@@ -628,17 +628,18 @@ class DockerPuller:
             # Download layer (stream)
             sys.stdout.write(ublob[7:19] + ": Downloading...")
             sys.stdout.flush()
-            try:
-                dl_by_aria2(
-                    url,
-                    gzip_path,
-                    headers=self.image_details.get_auth_headers(
-                        self.session, self.registry_username, self.registry_password
-                    ),
-                )
-            except Exception as e:
-                logger.error("[-] Failed to download layer %s: %s", ublob[7:19], e)
             bresp = self._fetch_layer_response(layer, ublob)
+            # try:
+            #     dl_by_aria2(
+            #         bresp.url,
+            #         gzip_path,
+            #         headers=self.image_details.get_auth_headers(
+            #             self.session, self.registry_username, self.registry_password
+            #         ),
+            #     )
+            #     continue
+            # except Exception as e:
+            #     logger.error("[-] Failed to download layer %s: %s", ublob[7:19], e)
 
             self._stream_save_gzip(bresp, gzip_path, ublob)
             self._decompress_layer(gzip_path, layerdir, ublob)
@@ -687,7 +688,7 @@ def dl_by_aria2(
     headers: dict | None = None,
     aria2_host: str = "http://localhost",
     aria2_port: int = 6800,
-    aria2_secret: str | None = None,
+    aria2_secret: str = "",
     timeout: int = 300,
 ):
     """
@@ -702,7 +703,7 @@ def dl_by_aria2(
     client = aria2p.Client(host=aria2_host, port=aria2_port, secret=aria2_secret)
     api = aria2p.API(client=client)
 
-    options = {}
+    options: dict = {}
     # aria2 options: set directory and output filename
     out_dir = os.path.dirname(out_path) or "."
     options["dir"] = out_dir
@@ -731,7 +732,7 @@ def dl_by_aria2(
                     f"aria2 reported complete, but file not found: {local}"
                 )
             return local
-        if d.is_error:
+        if d.error_code:
             raise RuntimeError(
                 f"aria2 download failed: {d.error_message} (gid={d.gid})"
             )
