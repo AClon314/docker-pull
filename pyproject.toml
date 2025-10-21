@@ -1,0 +1,49 @@
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = [ "setuptools>=61.0", "wheel" ]
+
+
+[project]
+dependencies = [ "aria2p" ]
+description = "download docker image as .tar file for `docker load -i img.tar` thanks to aria2p"
+keywords = [ "oci", "docker", "podman", "container", "aria2c", "aria2p" ]
+name = "docker_pull"
+readme = "README.md"
+version = "0.0.1"
+classifiers = [
+"License :: OSI Approved :: MIT License",
+"Programming Language :: Python",
+"Development Status :: 3 - Alpha",
+"Intended Audience :: Developers",
+"Programming Language :: Python :: 3",
+"Programming Language :: Python :: 3.11",
+"Programming Language :: Python :: 3.12",
+"Programming Language :: Python :: 3.13"
+]
+requires-python = ">=3.11"
+
+
+[[project.authors]]
+name = "nolca"
+email = "nolca@qq.com"
+
+
+[project.license]
+file = "LICENSE"
+
+
+[project.optional-dependencies]
+dev = [ "pytest", "pytest-asyncio" ]
+
+
+[project.urls]
+Download = "http://github.com/AClon314/aria2p_wrapper/releases"
+Homepage = "http://github.com/AClon314/aria2p_wrapper"
+
+
+[project.scripts]
+docker-pull = "docker_pull.docker_pull:script_entry"
+
+
+[tool.setuptools.package-dir]
+docker_pull = "."

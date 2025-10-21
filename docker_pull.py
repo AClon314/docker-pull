@@ -34,27 +34,25 @@ puller.save_image()
 
 Released under GNU General Public License v3.0 as `docker-drag`.
 """
-
-import os
-import sys
-import gzip
-import json
-import hashlib
-import shutil
-from typing import Literal, Self, get_args
+LAYER_TAR_GZ = "layer_gzip.tar"  # !!! rename to 'layer_gzip.tar' for docker-drag !!!
+from pathlib import Path
+import re, os, gzip, json, hashlib, shutil, tarfile, urllib3, logging, argparse
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import tarfile
-import urllib3
-import re
-import logging
-import argparse
+from typing import Literal, Self, get_args
 
 urllib3.disable_warnings()
 
 # Configure logging
 logger = logging.getLogger(__name__)
+# from pysnooper import snoop
+try:
+    from aria2p_wrapper import Aria, File
+
+    aria = Aria()
+except ImportError:
+    logger.warning("pip install aria2p_wrapper for aria2c support, fallback!")
 
 TYPE_REGISTRY = Literal[
     "registry.k8s.io",
@@ -91,7 +89,7 @@ def create_session() -> requests.Session:
 ############################################ HELPERS ######################################################
 
 
-class DockerImageDetails:
+class DockerImage:
     original_url: str
     """Original URL of the Docker image"""
     auth_url: str
@@ -103,8 +101,16 @@ class DockerImageDetails:
     tag: str = "latest"
     """Image tag"""
 
-    json_manifest_type = "application/vnd.docker.distribution.manifest.v2+json"
-    json_manifest_type_bis = "application/vnd.docker.distribution.manifest.list.v2+json"
+    accept_manifest = [
+        "application/vnd.docker.distribution.manifest.v2+json",
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+        "application/vnd.oci.image.manifest.v1+json",
+        "application/vnd.oci.image.index.v1+json",
+    ]
+
+    @property
+    def Accept(self):
+        return ",".join(self.accept_manifest)
 
     def __init__(
         self,
@@ -125,6 +131,7 @@ class DockerImageDetails:
         return f"https://{self.registry_host_url}/v2/{self.repo_name}/manifests/{name}"
 
     def get_blobs_url(self, digest: str) -> str:
+        """blob digest = sha256:<hex>"""
         return f"https://{self.registry_host_url}/v2/{self.repo_name}/blobs/{digest}"
 
     @property
@@ -136,13 +143,13 @@ class DockerImageDetails:
             return f"{self.registry_host_url}/{self.repo_name}"
 
     @property
-    def fully_qualified_image_name(self) -> str:
+    def full_name(self) -> str:
         """Fully qualified image name (registry, repository and tag)"""
         return f"{self.repository_reference}:{self.tag}"
 
     @property
-    def image_file_name(self) -> str:
-        return self.repo_name.replace("/", "_") + "_" + self.tag + ".tar"
+    def tar_filename(self) -> str:
+        return f"{self.repo_name.replace('/', '-')}-{self.tag}.tar"
 
     def get_auth_headers(
         self,
@@ -169,10 +176,14 @@ class DockerImageDetails:
                     request=resp.request,
                     response=resp,
                 )
-            access_token = resp.json()["token"]
+            js: dict = resp.json()
             auth_head = {
-                "Authorization": "Bearer " + access_token,
-                "Accept": f"{self.json_manifest_type},{self.json_manifest_type_bis}",
+                **(
+                    {"Authorization": "Bearer " + js["token"]}
+                    if "token" in js.keys()
+                    else {}
+                ),
+                "Accept": self.Accept,
             }
             return auth_head
         except requests.exceptions.RequestException as e:
@@ -259,16 +270,8 @@ class DockerImageDetails:
             else:
                 repo_without_last = "library"
         repository = f"{repo_without_last}/{img}"
-
         auth_url = cls.get_endpoint_registry(session, registry_host_url, repository)
-
-        logger.info("_" * 50)
-        logger.info(f"Docker image :\t{img}")
-        logger.info(f"Docker tag :\t{tag}")
-        logger.info(f"Repository :\t{repository}")
-        logger.info(f"Server URL :\t{registry_host_url}")
         logger.info(f"Auth endpoint :\t{auth_url}")
-        logger.info("_" * 50)
 
         return cls(
             original_url=image_name,
@@ -279,24 +282,25 @@ class DockerImageDetails:
         )
 
 
-# Docker style progress bar
-def progress_bar(ublob, nb_traits):
-    sys.stdout.write("\r" + ublob[7:19] + ": Downloading [")
+def Print(*args):
+    print(*args, end="", flush=True)
+
+
+def progress_bar(sha, nb_traits):
+    """Docker style [>>==]"""
+    Print(f"{sha[7:19]}: Downloading [")
     for i in range(0, nb_traits):
         if i == nb_traits - 1:
-            sys.stdout.write(">")
+            Print(">")
         else:
-            sys.stdout.write("=")
-    for i in range(0, 49 - nb_traits):
-        sys.stdout.write(" ")
-    sys.stdout.write("]")
-    sys.stdout.flush()
+            Print("=")
+    Print(" " * (49 - nb_traits) + "]")
 
 
 ############################################## MAIN ########################################################
 
 
-class DockerPuller:
+class DockerPull:
     """
     Orchestrates downloading a docker image and saving it as a tar archive.
 
@@ -308,6 +312,8 @@ class DockerPuller:
         session: requests.Session instance. Default uses create_session() result.
     """
 
+    _use_aria: bool = "aria" in globals()
+
     def __init__(
         self,
         image_url: str,
@@ -316,47 +322,41 @@ class DockerPuller:
         registry_password: str = "",
         session: requests.Session = create_session(),
     ):
-        self.image_url = image_url
         self.output_path = output_path
         self.registry_username = registry_username
         self.registry_password = registry_password
         self.session = session
-        self.img_temp_dir = "tmp"
-        self.image_details = DockerImageDetails.parse_image_name(
-            image_url, self.session
-        )
+        self.image = DockerImage.parse_image_name(image_url, self.session)
+        self.tmp_dir = "." + str(self.image.tar_filename).replace(".tar", "")
         # placeholder for values filled during flow
         self.manifest_json = {}
         self.confresp_content = b""
         self.fake_layerID = ""
+        self.unzip_queue: list[Path] = []
 
-    def save_image(self):
+    # @snoop("pull.log", depth=3)
+    def save_image(self, skip=0, keep_tmp=False) -> None:
         """High level orchestration; keeps each sub-step in a small method."""
-        try:
-            if not os.path.exists(self.img_temp_dir):
-                logger.debug("[+] Creating temporary directory: %s", self.img_temp_dir)
-                os.makedirs(self.img_temp_dir)
+        if not os.path.exists(self.tmp_dir):
+            logger.debug("[+] Creating temporary directory: %s", self.tmp_dir)
+            os.makedirs(self.tmp_dir)
 
-            self._fetch_manifest()
-            self._download_config()
-            self._download_layers()
-            self._create_tar_and_cleanup()
-            logger.info(
-                f"[+] Docker image for {self.image_details.fully_qualified_image_name} is saved to {self.output_path or self.image_details.image_file_name}"
-            )
-        finally:
-            # clean up temp folder no matter what happens
-            if os.path.exists(self.img_temp_dir):
-                shutil.rmtree(self.img_temp_dir)
+        self._fetch_manifest()
+        self._download_config()
+        self._download_layers(skip=skip)
+        self._create_tar()
+        logger.info(
+            f"[+] Docker image for {self.image.full_name} is saved to {self.output_path or self.image.tar_filename}"
+        )
+        if not keep_tmp and os.path.exists(self.tmp_dir):
+            shutil.rmtree(self.tmp_dir)
 
     def _fetch_manifest(self):
-        logger.info(
-            f"[+] Trying to fetch manifest for {self.image_details.fully_qualified_image_name}"
-        )
+        logger.info(f"[+] Trying to fetch manifest for {self.image.full_name}")
         try:
             resp = self.session.get(
-                self.image_details.get_manifest_url(),
-                headers=self.image_details.get_auth_headers(
+                self.image.get_manifest_url(),
+                headers=self.image.get_auth_headers(
                     self.session, self.registry_username, self.registry_password
                 ),
                 verify=False,
@@ -368,7 +368,7 @@ class DockerPuller:
 
         if resp.status_code != 200:
             logger.error(
-                f"[-] Cannot fetch manifest for {self.image_details.registry_host_url} [HTTP {resp.status_code}]"
+                f"[-] Cannot fetch manifest for {self.image.registry_host_url} [HTTP {resp.status_code}]"
             )
             logger.error(resp.content)
             raise
@@ -383,10 +383,8 @@ class DockerPuller:
                 selected_manifest = self._select_manifest(resp_json)
                 try:
                     manifest_resp = self.session.get(
-                        self.image_details.get_manifest_url(
-                            selected_manifest["digest"]
-                        ),
-                        headers=self.image_details.get_auth_headers(
+                        self.image.get_manifest_url(selected_manifest["digest"]),
+                        headers=self.image.get_auth_headers(
                             self.session, self.registry_username, self.registry_password
                         ),
                         verify=False,
@@ -454,8 +452,8 @@ class DockerPuller:
         config_digest = self.manifest_json["config"]["digest"]
         try:
             confresp = self.session.get(
-                self.image_details.get_blobs_url(config_digest),
-                headers=self.image_details.get_auth_headers(
+                self.image.get_blobs_url(config_digest),
+                headers=self.image.get_auth_headers(
                     self.session, self.registry_username, self.registry_password
                 ),
                 verify=False,
@@ -465,38 +463,38 @@ class DockerPuller:
             logger.error("[-] Config fetch error: %s", str(e))
             raise
         self.confresp_content = confresp.content
-        with open(f"{self.img_temp_dir}/{config_digest[7:]}.json", "wb") as file:
+        with open(f"{self.tmp_dir}/{config_digest[7:]}.json", "wb") as file:
             file.write(self.confresp_content)
 
         # create base manifest file content list
         self._manifest_content = [
             {
                 "Config": config_digest[7:] + ".json",
-                "RepoTags": [self.image_details.fully_qualified_image_name],
+                "RepoTags": [self.image.full_name],
                 "Layers": [],
             }
         ]
 
-    def _compute_fake_layerID(self, parentid: str, ublob: str) -> str:
+    def _compute_fake_layerID(self, parentid: str, sha: str) -> str:
         """Compute fake layer id from parentid and digest."""
         return hashlib.sha256(
-            (parentid + "\n" + ublob + "\n").encode("utf-8")
+            (parentid + "\n" + sha + "\n").encode("utf-8")
         ).hexdigest()
 
-    def _prepare_layer_dir(self, fake_layerID: str) -> str:
+    def _prepare_layer_dir(self, fake_layerID: str):
         """Create directory for a layer and write VERSION file."""
-        layerdir = os.path.join(self.img_temp_dir, fake_layerID)
-        os.makedirs(layerdir, exist_ok=True)
-        with open(os.path.join(layerdir, "VERSION"), "w") as f:
+        layerdir = Path(self.tmp_dir) / fake_layerID
+        layerdir.mkdir(parents=True, exist_ok=True)
+        with open(layerdir / "VERSION", "w") as f:
             f.write("1.0")
         return layerdir
 
-    def _fetch_layer_response(self, layer: dict, ublob: str) -> requests.Response:
+    def _fetch_layer_response(self, layer: dict, sha: str) -> requests.Response:
         """Fetch layer content (primary blob URL then fallback to layer['urls'][0])."""
         try:
             bresp = self.session.get(
-                self.image_details.get_blobs_url(ublob),
-                headers=self.image_details.get_auth_headers(
+                self.image.get_blobs_url(sha),
+                headers=self.image.get_auth_headers(
                     self.session, self.registry_username, self.registry_password
                 ),
                 stream=True,
@@ -516,7 +514,7 @@ class DockerPuller:
                 try:
                     bresp = self.session.get(
                         fallback_url,
-                        headers=self.image_details.get_auth_headers(
+                        headers=self.image.get_auth_headers(
                             self.session, self.registry_username, self.registry_password
                         ),
                         stream=True,
@@ -529,54 +527,69 @@ class DockerPuller:
             if bresp.status_code != 200:
                 logger.error(
                     "[-] ERROR: Cannot download layer %s [HTTP %s]",
-                    ublob[7:19],
+                    sha[7:19],
                     bresp.status_code,
                 )
                 logger.error(bresp.content)
                 raise
         return bresp
 
-    def _stream_save_gzip(
-        self, bresp: requests.Response, gzip_path: str, ublob: str
-    ) -> None:
+    def _stream_save_gzip(self, bresp: requests.Response, gzip: Path, sha: str) -> None:
         """Stream response content into gzip_path while updating the progress bar."""
-        try:
-            bresp.raise_for_status()
-        except Exception as e:
-            logger.error("[-] Layer stream error: %s", e)
-            raise
+        if self._use_aria:
+            try:
+                file = File(bresp.url, path=gzip, sha256=sha[7:])
+                aria.download(file, response=bresp)
+                return
+            except Exception as e:
+                if logger.isEnabledFor(logging.DEBUG):
+                    raise e
+                logger.error(f"[-] aria failed download layer {sha[7:19]}: {e}")
 
+        # 普通下载方式
         content_length = int(bresp.headers.get("Content-Length", "0"))
         unit = content_length / 50 if content_length else 1
         acc = 0
         nb_traits = 0
-        progress_bar(ublob, nb_traits)
-        with open(gzip_path, "wb") as file:
+        progress_bar(sha, nb_traits)
+        with open(gzip, "wb") as file:
             for chunk in bresp.iter_content(chunk_size=8192):
                 if chunk:
                     file.write(chunk)
                     acc += len(chunk)
                     if acc > unit:
                         nb_traits += 1
-                        progress_bar(ublob, nb_traits)
+                        progress_bar(sha, nb_traits)
                         acc = 0
 
-    def _decompress_layer(self, gzip_path: str, layerdir: str, ublob: str) -> None:
-        """Decompress gzip_path into layer.tar inside layerdir and remove gzip file."""
-        sys.stdout.write(f"\r{ublob[7:19]}: Extracting...{' ' * 50}")
-        sys.stdout.flush()
-        with open(os.path.join(layerdir, "layer.tar"), "wb") as out_f:
-            with gzip.open(gzip_path, "rb") as unzLayer:
-                shutil.copyfileobj(unzLayer, out_f)
+    def _decompress_layer(
+        self, gzip: Path, sha: str = "sha256:", buffer=1024**3
+    ) -> None:
+        """gzip to tar, limit buffer default to 1GB"""
+        sha = sha[7:19]
+        if not sha:
+            sha = gzip.parent.name
+        logger.info(f"{sha}: Extracting `layer.tar.gz` to `layer.tar`")
+
         try:
-            os.remove(gzip_path)
-        except Exception:
-            # don't block on cleanup failure
-            logger.debug("[-] Failed to remove temporary gzip file: %s", gzip_path)
+            with open(os.path.join(gzip.parent, "layer.tar"), "wb") as tar_f:
+                with gzip.open("rb") as gz_f:
+                    # 使用有限缓冲区进行解压，防止内存占用过大
+                    while chunk := gz_f.read(buffer):
+                        tar_f.write(chunk)
+
+            logger.info(f"{sha}: Extraction OK")
+            try:
+                if os.path.exists(gzip):
+                    os.remove(gzip)
+            except Exception as e:
+                logger.debug(f"[-] Failed to remove temp gzip {gzip}: {e}")
+        except Exception as e:
+            logger.error(f"[-] Extraction failed on {sha}: {e}")
+            raise
 
     def _build_and_write_layer_json(
         self,
-        layer: dict,
         is_last: bool,
         fake_layerID: str,
         parentid: str,
@@ -611,136 +624,79 @@ class DockerPuller:
 
         return json_obj["id"]
 
-    def _download_layers(self):
+    def _download_layers(self, skip=0):
         """High-level loop over manifest layers delegating to helper methods."""
-        layers = self.manifest_json["layers"]
+        layers: list[dict[str, str]] = self.manifest_json["layers"]
         empty_json = '{"created":"1970-01-01T00:00:00Z","container_config":{"Hostname":"","Domainname":"","User":"","AttachStdin":false, \
             "AttachStdout":false,"AttachStderr":false,"Tty":false,"OpenStdin":false, "StdinOnce":false,"Env":null,"Cmd":null,"Image":"", \
             "Volumes":null,"WorkingDir":"","Entrypoint":null,"OnBuild":null,"Labels":null}}'
 
         parentid = ""
-        for layer in layers:
-            ublob = layer["digest"]
-            fake_layerID = self._compute_fake_layerID(parentid, ublob)
-            layerdir = self._prepare_layer_dir(fake_layerID)
-            gzip_path = os.path.join(layerdir, "layer_gzip.tar")
+        len_layers = len(layers)
+        # download_tasks = []
+
+        for i, layer in enumerate(layers):
+            if i < skip:
+                continue
+            sha = layer["digest"]
+            fake_layerID = self._compute_fake_layerID(parentid, sha)
+            layerDir = self._prepare_layer_dir(fake_layerID)
+            tar_gzip = layerDir / LAYER_TAR_GZ
 
             # Download layer (stream)
-            sys.stdout.write(ublob[7:19] + ": Downloading...")
-            sys.stdout.flush()
-            bresp = self._fetch_layer_response(layer, ublob)
-            # try:
-            #     dl_by_aria2(
-            #         bresp.url,
-            #         gzip_path,
-            #         headers=self.image_details.get_auth_headers(
-            #             self.session, self.registry_username, self.registry_password
-            #         ),
-            #     )
-            #     continue
-            # except Exception as e:
-            #     logger.error("[-] Failed to download layer %s: %s", ublob[7:19], e)
+            logger.info(f"{i}/{len_layers}\t{sha[7:19]}: Downloading...")
+            bresp = self._fetch_layer_response(layer, sha)
+            self._stream_save_gzip(bresp, tar_gzip, sha)
+            self.unzip_queue.append(tar_gzip)
 
-            self._stream_save_gzip(bresp, gzip_path, ublob)
-            self._decompress_layer(gzip_path, layerdir, ublob)
+            if not (self._use_aria):
+                logger.info(
+                    f"{sha[7:19]}: Downloaded [{bresp.headers.get('Content-Length')}]"
+                )
 
-            logger.info(
-                "\r%s: Pull complete [%s]\r",
-                ublob[7:19],
-                bresp.headers.get("Content-Length"),
-            )
             self._manifest_content[0]["Layers"].append(fake_layerID + "/layer.tar")
 
             # Create layer json and update parentid
             is_last = layers[-1]["digest"] == layer["digest"]
             parentid = self._build_and_write_layer_json(
-                layer, is_last, fake_layerID, parentid, empty_json, layerdir
+                is_last, fake_layerID, parentid, empty_json, str(layerDir)
             )
 
             # record last fake id for repositories mapping
             self.fake_layerID = fake_layerID
+            # download_tasks.append((gzip_path, sha))
 
-    def _create_tar_and_cleanup(self):
+        # 等待所有aria任务完成
+        if "aria" in globals():
+            try:
+                aria.wait_all()
+            except Exception as e:
+                logger.error(f"[-] Error waiting for aria downloads: {e}")
+
+    def _create_tar(self):
+        logger.info("[=] Decompressing layers...")
+        gzips_lack = [g for g in self.unzip_queue if not g.exists()]
+        for gzip in self.unzip_queue:
+            if gzip.exists():
+                self._decompress_layer(gzip)
+        if gzips_lack:
+            raise FileNotFoundError(f"{gzips_lack}")
+
         # manifest.json
-        with open(os.path.join(self.img_temp_dir, "manifest.json"), "w") as mf:
+        with open(os.path.join(self.tmp_dir, "manifest.json"), "w") as mf:
             mf.write(json.dumps(self._manifest_content))
 
-        content = {
-            self.image_details.repository_reference: {
-                self.image_details.tag: self.fake_layerID
-            }
-        }
-        with open(os.path.join(self.img_temp_dir, "repositories"), "w") as rf:
+        content = {self.image.repository_reference: {self.image.tag: self.fake_layerID}}
+        with open(os.path.join(self.tmp_dir, "repositories"), "w") as rf:
             rf.write(json.dumps(content))
 
         logger.info("[=] Creating archive...")
-        out_path = self.output_path or self.image_details.image_file_name
+        out_path = self.output_path or self.image.tar_filename
         if not str(out_path).endswith(".tar"):
             out_path = str(out_path) + ".tar"
         with tarfile.open(out_path, "w") as tar:
-            tar.add(self.img_temp_dir, arcname=os.path.sep)
+            tar.add(self.tmp_dir, arcname=os.path.sep)
         self.output_path = out_path
-
-
-def dl_by_aria2(
-    url: str,
-    out_path: str,
-    headers: dict | None = None,
-    aria2_host: str = "http://localhost",
-    aria2_port: int = 6800,
-    aria2_secret: str = "",
-    timeout: int = 300,
-):
-    """
-    Use aria2 RPC (aria2p) to download `url` into `out_path`. Waits until download completes.
-    Raises RuntimeError on failure.
-    """
-    try:
-        import aria2p
-    except Exception as e:
-        raise RuntimeError("aria2p not installed") from e
-
-    client = aria2p.Client(host=aria2_host, port=aria2_port, secret=aria2_secret)
-    api = aria2p.API(client=client)
-
-    options: dict = {}
-    # aria2 options: set directory and output filename
-    out_dir = os.path.dirname(out_path) or "."
-    options["dir"] = out_dir
-    options["out"] = os.path.basename(out_path)
-
-    if headers:
-        # convert dict -> list of "Header: value"
-        hdrs = [f"{k}: {v}" for k, v in headers.items()]
-        options["header"] = hdrs
-
-    # add uri and start download
-    download = api.add_uris([url], options=options)
-
-    # wait loop (poll)
-    import time
-
-    start = time.time()
-    while True:
-        # refresh download state
-        d = api.get_download(download.gid)
-        if d.is_complete:
-            # success
-            local = os.path.join(out_dir, options["out"])
-            if not os.path.exists(local):
-                raise RuntimeError(
-                    f"aria2 reported complete, but file not found: {local}"
-                )
-            return local
-        if d.error_code:
-            raise RuntimeError(
-                f"aria2 download failed: {d.error_message} (gid={d.gid})"
-            )
-        if time.time() - start > timeout:
-            raise RuntimeError(
-                f"aria2 download timeout after {timeout}s for gid={download.gid}"
-            )
-        time.sleep(0.5)
 
 
 def parse_arg():
@@ -768,11 +724,16 @@ def parse_arg():
         default=os.getenv("REGISTRY_PASSWORD", ""),
     )
     parser.add_argument(
+        "--skip",
+        "-s",
+        type=int,
+        help="skip the first n layers",
+        default=0,
+    )
+    parser.add_argument(
         "--verbose",
-        "-v",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        help="set logging level (default: INFO)",
+        action="store_true",
+        help="keep temp files, set logging level to DEBUG",
     )
     try:
         import argcomplete
@@ -784,18 +745,21 @@ def parse_arg():
     return args
 
 
-if __name__ == "__main__":
+def script_entry():
     args = parse_arg()
-    logging.basicConfig(level=args.verbose)
-    logger.setLevel(args.verbose)
+    logger.setLevel(logging.DEBUG if args.verbose else logging.INFO)
     try:
-        puller = DockerPuller(
+        puller = DockerPull(
             args.image,
             output_path=args.output_path,
             registry_username=args.username,
             registry_password=args.password,
         )
-        puller.save_image()
+        puller.save_image(skip=args.skip, keep_tmp=args.verbose)
     except KeyboardInterrupt:
         logger.warning("[-] Interrupted by user")
         exit(1)
+
+
+if __name__ == "__main__":
+    script_entry()
