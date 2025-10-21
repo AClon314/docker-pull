@@ -34,7 +34,7 @@ puller.save_image()
 
 Released under GNU General Public License v3.0 as `docker-drag`.
 """
-LAYER_TAR_GZ = "layer_gzip.tar"  # !!! rename to 'layer_gzip.tar' for docker-drag !!!
+LAYER_TAR_GZ = "layer.tar.gz"  # !!! rename to 'layer_gzip.tar' for docker-drag !!!
 from pathlib import Path
 import re, os, gzip, json, hashlib, shutil, tarfile, urllib3, logging, argparse
 import requests
@@ -48,7 +48,7 @@ urllib3.disable_warnings()
 logger = logging.getLogger(__name__)
 # from pysnooper import snoop
 try:
-    from aria2p_wrapper import Aria, File
+    from aria2p_wrapper import Aria, File, Log
 
     aria = Aria()
 except ImportError:
@@ -542,8 +542,8 @@ class DockerPull:
                 aria.download(file, response=bresp)
                 return
             except Exception as e:
-                if logger.isEnabledFor(logging.DEBUG):
-                    raise e
+                # if logger.isEnabledFor(logging.DEBUG):
+                #     raise e
                 logger.error(f"[-] aria failed download layer {sha[7:19]}: {e}")
 
         # 普通下载方式
@@ -568,7 +568,7 @@ class DockerPull:
         """gzip to tar, limit buffer default to 1GB"""
         sha = sha[7:19]
         if not sha:
-            sha = gzip.parent.name
+            sha = gzip.parent.name[7:19]
         logger.info(f"{sha}: Extracting `layer.tar.gz` to `layer.tar`")
 
         try:
@@ -644,7 +644,7 @@ class DockerPull:
             tar_gzip = layerDir / LAYER_TAR_GZ
 
             # Download layer (stream)
-            logger.info(f"{i}/{len_layers}\t{sha[7:19]}: Downloading...")
+            logger.info(f"{i+1}/{len_layers}\t{sha[7:19]}: Downloading...")
             bresp = self._fetch_layer_response(layer, sha)
             self._stream_save_gzip(bresp, tar_gzip, sha)
             self.unzip_queue.append(tar_gzip)
@@ -671,16 +671,18 @@ class DockerPull:
             try:
                 aria.wait_all()
             except Exception as e:
+                # if Log.isEnabledFor(logging.DEBUG):
+                #     raise e
                 logger.error(f"[-] Error waiting for aria downloads: {e}")
 
     def _create_tar(self):
         logger.info("[=] Decompressing layers...")
-        gzips_lack = [g for g in self.unzip_queue if not g.exists()]
+        gzip_lack = [g for g in self.unzip_queue if not g.exists()]
         for gzip in self.unzip_queue:
             if gzip.exists():
                 self._decompress_layer(gzip)
-        if gzips_lack:
-            raise FileNotFoundError(f"{gzips_lack}")
+        if gzip_lack:
+            raise FileNotFoundError(f"{gzip_lack}")
 
         # manifest.json
         with open(os.path.join(self.tmp_dir, "manifest.json"), "w") as mf:
@@ -747,7 +749,10 @@ def parse_arg():
 
 def script_entry():
     args = parse_arg()
-    logger.setLevel(logging.DEBUG if args.verbose else logging.INFO)
+    LOGLVL = logging.DEBUG if args.verbose else logging.INFO
+    logger.setLevel(LOGLVL)
+    if "Log" in globals():
+        Log.setLevel(LOGLVL)
     try:
         puller = DockerPull(
             args.image,
