@@ -327,7 +327,7 @@ class DockerPull:
         self.registry_password = registry_password
         self.session = session
         self.image = DockerImage.parse_image_name(image_url, self.session)
-        self.tmp_dir = "." + str(self.image.tar_filename).replace(".tar", "")
+        self.tmp_dir = str(self.image.tar_filename).replace(".tar", "")
         # placeholder for values filled during flow
         self.manifest_json = {}
         self.confresp_content = b""
