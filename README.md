@@ -12,7 +12,11 @@ You need to install `aria2c` manually.
 pixi global install aria2c
 # install docker-pull
 uv pip install git+https://github.com/aclon314/docker-pull.git
+# example
+docker-pull busybox
 ```
+
+> Because some huge layers (>5GB) could easily failed to download, and docker/podman DON'T support resume download(though they support cached layers if the layers are 100% downloaded).
 
 ## Pull a Docker image in HTTPS
 
