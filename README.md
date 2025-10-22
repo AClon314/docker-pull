@@ -1,7 +1,18 @@
-# docker-drag
+# docker-pull
 This repository contains Python scripts for interacting with Docker Hub or other registries, without needing the Docker client itself.
 
 It relies on the Docker registry [HTTPS API v2](https://docs.docker.com/registry/spec/api/).
+
+## Use aria2c as downloader
+
+You need to install `aria2c` manually.
+
+```sh
+# use pixi as package manager
+pixi global install aria2c
+# install docker-pull
+uv pip install git+https://github.com/aclon314/docker-pull.git
+```
 
 ## Pull a Docker image in HTTPS
 

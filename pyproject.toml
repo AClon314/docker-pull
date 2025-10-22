@@ -4,7 +4,10 @@ requires = [ "setuptools>=61.0", "wheel" ]
 
 
 [project]
-dependencies = [ "aria2p" ]
+dependencies = [
+"aria2p",
+"aria2p_wrapper@git+https://github.com/AClon314/aria2p_wrapper.git"
+]
 description = "download docker image as .tar file for `docker load -i img.tar` thanks to aria2p"
 keywords = [ "oci", "docker", "podman", "container", "aria2c", "aria2p" ]
 name = "docker_pull"
@@ -24,7 +27,7 @@ requires-python = ">=3.11"
 
 
 [[project.authors]]
-name = "nolca"
+name = "NotGlop, slkoo-cc, heran226813, lenrys29, nolca"
 email = "nolca@qq.com"
 
 
