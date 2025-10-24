@@ -36,7 +36,7 @@ Released under GNU General Public License v3.0 as `docker-drag`.
 """
 LAYER_TAR_GZ = "layer.tar.gz"  # !!! rename to 'layer_gzip.tar' for docker-drag !!!
 from pathlib import Path
-import re, os, gzip, json, hashlib, shutil, tarfile, urllib3, logging, argparse
+import re, os, json, hashlib, shutil, tarfile, urllib3, logging, argparse
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -668,12 +668,7 @@ class DockerPull:
 
         # 等待所有aria任务完成
         if "aria" in globals():
-            try:
-                aria.wait_all()
-            except Exception as e:
-                # if Log.isEnabledFor(logging.DEBUG):
-                #     raise e
-                logger.error(f"[-] Error waiting for aria downloads: {e}")
+            aria.wait_all()
 
     def _create_tar(self):
         logger.info("[=] Decompressing layers...")
