@@ -11,7 +11,7 @@ You need to install `aria2c` manually.
 # use pixi as package manager
 pixi global install aria2c
 # install docker-pull
-uv pip install git+https://github.com/aclon314/docker-pull.git
+uv pip install docker_pull[aria2]@git+https://github.com/aclon314/docker-pull.git
 # example
 docker-pull busybox
 ```
