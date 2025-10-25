@@ -36,11 +36,11 @@ Released under GNU General Public License v3.0 as `docker-drag`.
 """
 LAYER_TAR_GZ = "layer.tar.gz"  # !!! rename to 'layer_gzip.tar' for docker-drag !!!
 from pathlib import Path
-import re, os, json, hashlib, shutil, tarfile, urllib3, logging, argparse
+import re, os, json, time, hashlib, shutil, tarfile, urllib3, logging, argparse
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from typing import Literal, Self, get_args
+from typing import Iterable, Literal, Self, get_args
 
 urllib3.disable_warnings()
 
@@ -64,10 +64,10 @@ TYPE_REGISTRY = Literal[
 REGISTRY = [reg + "/" for reg in get_args(TYPE_REGISTRY)]
 
 
-def create_session() -> requests.Session:
+def create_session(retry=3) -> requests.Session:
     session = requests.Session()
     retry_strategy = Retry(
-        total=3,
+        total=retry,
         backoff_factor=1,
         status_forcelist=[429, 500, 502, 503, 504],
     )
@@ -288,7 +288,7 @@ def Print(*args):
 
 def progress_bar(sha, nb_traits):
     """Docker style [>>==]"""
-    Print(f"{sha[7:19]}: Downloading [")
+    Print(f"\r{sha[7:19]}: Downloading [")
     for i in range(0, nb_traits):
         if i == nb_traits - 1:
             Print(">")
@@ -312,7 +312,7 @@ class DockerPull:
         session: requests.Session instance. Default uses create_session() result.
     """
 
-    _use_aria: bool = "aria" in globals()
+    _aria_valid: bool = "aria" in globals()
 
     def __init__(
         self,
@@ -321,6 +321,13 @@ class DockerPull:
         registry_username: str = "",
         registry_password: str = "",
         session: requests.Session = create_session(),
+        only: Iterable[str] = set(),
+        skip: Iterable[int] = set(),
+        retry=10,
+        aria2=True,
+        verify=False,
+        keep_tmp=False,
+        verbose=False,
     ):
         self.output_path = output_path
         self.registry_username = registry_username
@@ -328,6 +335,13 @@ class DockerPull:
         self.session = session
         self.image = DockerImage.parse_image_name(image_url, self.session)
         self.tmp_dir = str(self.image.tar_filename).replace(".tar", "")
+        self.only = only
+        self.skip = skip
+        self.retry = retry
+        self._aria_valid = aria2 and self._aria_valid
+        self.verify = verify
+        self.keep_tmp = keep_tmp
+        self.verbose = verbose
         # placeholder for values filled during flow
         self.manifest_json = {}
         self.confresp_content = b""
@@ -335,20 +349,39 @@ class DockerPull:
         self.unzip_queue: list[Path] = []
 
     # @snoop("pull.log", depth=3)
-    def save_image(self, skip=0, keep_tmp=False) -> None:
-        """High level orchestration; keeps each sub-step in a small method."""
+    def save_image(self) -> None:
+        """use temp dir `IMAGE_NAME-TAG/` to save tars, then create final tar from there.
+
+        Args:
+            skip: list of layer indexes to skip
+            keep_tmp: whether to keep temp dir `IMAGE_NAME-TAG/` after creating tar
+            retry: could set to <=0 to disable retry. Continuous retry counts when fail repeatdly.
+        """
         if not os.path.exists(self.tmp_dir):
             logger.debug("[+] Creating temporary directory: %s", self.tmp_dir)
             os.makedirs(self.tmp_dir)
 
-        self._fetch_manifest()
-        self._download_config()
-        self._download_layers(skip=skip)
-        self._create_tar()
+        tried = 0
+        retry = self.retry
+        while retry > 0:
+            try:
+                self._fetch_manifest()
+                self._download_config()
+                self._download_layers(skip=self.skip)
+                break  # Success
+            except Exception as e:
+                tried += 1
+                if tried >= retry:
+                    raise RuntimeError("[-] All retries failed") from e
+                timer = int(2 + 1.5 ** (tried - 1))
+                logger.error(f"[-] Retry after {timer} seconds from error: {e}")
+                time.sleep(timer)  # Exponential backoff
+        self._create_tar(keep_tmp=self.keep_tmp)
+
         logger.info(
             f"[+] Docker image for {self.image.full_name} is saved to {self.output_path or self.image.tar_filename}"
         )
-        if not keep_tmp and os.path.exists(self.tmp_dir):
+        if not self.keep_tmp and os.path.exists(self.tmp_dir):
             shutil.rmtree(self.tmp_dir)
 
     def _fetch_manifest(self):
@@ -359,7 +392,7 @@ class DockerPull:
                 headers=self.image.get_auth_headers(
                     self.session, self.registry_username, self.registry_password
                 ),
-                verify=False,
+                verify=self.verify,
                 timeout=30,
             )
         except requests.exceptions.RequestException as e:
@@ -387,7 +420,7 @@ class DockerPull:
                         headers=self.image.get_auth_headers(
                             self.session, self.registry_username, self.registry_password
                         ),
-                        verify=False,
+                        verify=self.verify,
                         timeout=30,
                     )
                     if manifest_resp.status_code != 200:
@@ -456,7 +489,7 @@ class DockerPull:
                 headers=self.image.get_auth_headers(
                     self.session, self.registry_username, self.registry_password
                 ),
-                verify=False,
+                verify=self.verify,
                 timeout=30,
             )
         except requests.exceptions.RequestException as e:
@@ -498,7 +531,7 @@ class DockerPull:
                     self.session, self.registry_username, self.registry_password
                 ),
                 stream=True,
-                verify=False,
+                verify=self.verify,
                 timeout=30,
             )
         except requests.exceptions.RequestException as e:
@@ -518,7 +551,7 @@ class DockerPull:
                             self.session, self.registry_username, self.registry_password
                         ),
                         stream=True,
-                        verify=False,
+                        verify=self.verify,
                         timeout=30,
                     )
                 except requests.exceptions.RequestException as e:
@@ -536,7 +569,7 @@ class DockerPull:
 
     def _stream_save_gzip(self, bresp: requests.Response, gzip: Path, sha: str) -> None:
         """Stream response content into gzip_path while updating the progress bar."""
-        if self._use_aria:
+        if self._aria_valid:
             try:
                 file = File(bresp.url, path=gzip, sha256=sha[7:])
                 aria.download(file, response=bresp)
@@ -563,7 +596,7 @@ class DockerPull:
                         acc = 0
 
     def _decompress_layer(
-        self, gzip: Path, sha: str = "sha256:", buffer=1024**3
+        self, gzip: Path, sha: str = "sha256:", buffer=1024**3, remove=True
     ) -> None:
         """gzip to tar, limit buffer default to 1GB"""
         sha = sha[7:19]
@@ -580,7 +613,7 @@ class DockerPull:
 
             logger.info(f"{sha}: Extraction OK")
             try:
-                if os.path.exists(gzip):
+                if remove and os.path.exists(gzip):
                     os.remove(gzip)
             except Exception as e:
                 logger.debug(f"[-] Failed to remove temp gzip {gzip}: {e}")
@@ -624,7 +657,12 @@ class DockerPull:
 
         return json_obj["id"]
 
-    def _download_layers(self, skip=0):
+    def _download_layers(
+        self,
+        only: Iterable[str] = set(),
+        skip: Iterable[int] = set(),
+        keep_tmp=False,
+    ):
         """High-level loop over manifest layers delegating to helper methods."""
         layers: list[dict[str, str]] = self.manifest_json["layers"]
         empty_json = '{"created":"1970-01-01T00:00:00Z","container_config":{"Hostname":"","Domainname":"","User":"","AttachStdin":false, \
@@ -633,13 +671,20 @@ class DockerPull:
 
         parentid = ""
         len_layers = len(layers)
-        # download_tasks = []
 
         for i, layer in enumerate(layers):
-            if i < skip:
-                continue
             sha = layer["digest"]
             fake_layerID = self._compute_fake_layerID(parentid, sha)
+            if i + 1 in skip:
+                logger.debug(
+                    f"{i+1}/{len_layers}\t{layer['digest'][7:19]}: Skip {fake_layerID[:12]}"
+                )
+                continue
+            if only and not any([fake_layerID.startswith(ol) for ol in only]):
+                logger.debug(
+                    f"{i+1}/{len_layers}\t{layer['digest'][7:19]}: Skip {fake_layerID[:12]}"
+                )
+                continue
             layerDir = self._prepare_layer_dir(fake_layerID)
             tar_gzip = layerDir / LAYER_TAR_GZ
 
@@ -649,7 +694,7 @@ class DockerPull:
             self._stream_save_gzip(bresp, tar_gzip, sha)
             self.unzip_queue.append(tar_gzip)
 
-            if not (self._use_aria):
+            if not (self._aria_valid):
                 logger.info(
                     f"{sha[7:19]}: Downloaded [{bresp.headers.get('Content-Length')}]"
                 )
@@ -667,15 +712,16 @@ class DockerPull:
             # download_tasks.append((gzip_path, sha))
 
         # 等待所有aria任务完成
-        if "aria" in globals():
+        if self._aria_valid:
             aria.wait_all()
 
-    def _create_tar(self):
+    def _create_tar(self, keep_tmp=False):
+        """after tar created, remove all layer.tar.gz files"""
         logger.info("[=] Decompressing layers...")
         gzip_lack = [g for g in self.unzip_queue if not g.exists()]
         for gzip in self.unzip_queue:
             if gzip.exists():
-                self._decompress_layer(gzip)
+                self._decompress_layer(gzip, remove=not keep_tmp)
         if gzip_lack:
             raise FileNotFoundError(f"{gzip_lack}")
 
@@ -723,14 +769,23 @@ def parse_arg():
     parser.add_argument(
         "--skip",
         "-s",
-        type=int,
-        help="skip the first n layers",
-        default=0,
+        type=str,
+        help="skip which layers, eg: 1,2 (Don't download) / eg2: !1,2 (Download only) / eg3: !0abc (hash folder prefix with at least 4 characters)",
+    )
+    parser.add_argument(
+        "--aria-not",
+        action="store_true",
+        help="do NOT use aria2c to download layers",
     )
     parser.add_argument(
         "--verbose",
         action="store_true",
         help="keep temp files, set logging level to DEBUG",
+    )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="verify SSL certificate",
     )
     try:
         import argcomplete
@@ -748,14 +803,30 @@ def script_entry():
     logger.setLevel(LOGLVL)
     if "Log" in globals():
         Log.setLevel(LOGLVL)
+    skip = only = set()
+    if args.skip:
+        txt = str(args.skip).strip()
+        if is_not := txt.startswith("!"):
+            txt = txt[1:]
+        txt = txt.split(",")
+        skip = {int(x) for x in txt if len(x) <= 3}
+        only = {x for x in txt if len(x) >= 4}
+        if is_not:
+            skip = set(range(1, 1000)) - skip  # TODO: Edge case
     try:
         puller = DockerPull(
             args.image,
             output_path=args.output_path,
             registry_username=args.username,
             registry_password=args.password,
+            only=only,
+            skip=skip,
+            verify=args.verify,
+            aria2=not args.aria_not,
+            keep_tmp=args.verbose,
+            verbose=args.verbose,
         )
-        puller.save_image(skip=args.skip, keep_tmp=args.verbose)
+        puller.save_image()
     except KeyboardInterrupt:
         logger.warning("[-] Interrupted by user")
         exit(1)
